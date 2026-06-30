@@ -36,6 +36,24 @@ The security of these devices is terrible.
 	- p2p-003.host.tange365.com </BR>
 	Check the behavior of your one with [a sniffer!](https://github.com/Jalecom/AJ_HC1703L_Teardown/tree/main/sniffer)
 
+**Credentials stored in plaintext on flash:**
+
+The file `/home/devParam.dat` (permanent flash, survives power cycles) stores the WiFi
+SSID and password in plaintext at fixed offsets (+0x100 and +0x12c respectively).
+Anyone with shell access to the camera can read your WiFi password with a simple `hexdump`.
+
+**Root password hardcoded in the binary:**
+
+The `p2pcam` binary writes `/etc/passwd` on every boot with a hardcoded root password
+(`cxlinux`). The password cannot be changed persistently — `p2pcam` overwrites the file
+on every reboot. The hash uses DES crypt with salt `"yi"` (confirmed from binary).
+
+**RTSP has no authentication by default:**
+
+The `no_rtsp_auth` field in `defalut.config` defaults to `1`, meaning the RTSP stream
+on port 554 requires no username or password. Anyone on the same network can view the
+camera feed without credentials.
+
 ## Hack Features
 
 * BusyBox v1.36.1 (2025-10-26 10:33:05 CET) - It’s been compiled with most functions included. Not all of them are currently installed, but they can still be called directly. See: `busybox --help`
@@ -101,6 +119,112 @@ Current version works from microSD card and do not require installation.
 
 ## Additional info
 
+### Trigger / flag files
+
+Files whose presence activates mechanisms in the firmware. None need to contain data unless noted.
+
+**SD card root (`/mnt/` — checked by `start.sh` before WiFi loads)**
+
+| File | Effect |
+|------|--------|
+| `debug_cmd.sh` | Executed as root shell script before `p2pcam` starts |
+| `firmware.bin` | Firmware upgrade from SD. If `OTA` is also present, camera does not reboot to factory mode after flashing |
+| `OTA` | Modifier for `firmware.bin` upgrade — OTA mode, no factory reboot |
+| `FSRW` | Triggers `factory_tool.sh` (provisioning) + starts `tees` logging daemon + leaves `/bak` mounted read-write during `p2pcam` |
+| `rmid` | Same `factory_tool.sh` trigger as `FSRW`; within that script, deletes `/bak/eye.conf` |
+
+**SD card — processed by `factory_tool.sh` (requires `FSRW` or `rmid` to be present)**
+
+| File pattern | Effect |
+|-------------|--------|
+| `eyeconf/*.conf` | Installed as `/bak/eye.conf` — only if `/bak/eye.conf` does not already exist |
+| `rmid` | Deletes `/bak/eye.conf` |
+| `*-hwcfg.ini` | Copied to `/bak/hwcfg.ini` |
+| `*-hardinfo.bin` | Copied to `/bak/hardinfo.bin` (GPIO map, board type, sensor) |
+| `*-ptz.cfg` | Copied to `/bak/ptz.cfg` |
+| `*-custom_init.sh` | Copied to `/bak/custom_init.sh` |
+| `*-VOICE.tgz` | Copied to `/bak/VOICE.tgz` (voice prompts) |
+
+**SD card root (`/mnt/mmc01/` — checked by `p2pcam` via `init_sd_card`, binary analysis confirmed)**
+
+> Note: `init_sd_card` mounts the SD temporarily at `/mnt/mmc01` (not `/mnt/mmc01/0/`), reads these files, then unmounts. The normal runtime path is `/mnt/mmc01/0/`.
+
+| File | Effect |
+|------|--------|
+| `HARDTEST` | Factory QA mode: starts `telnetd`, resets RTC to year 2000, sets ONVIF/P2P flags |
+| `FSRW` | Sets `g_fsrw_flag` — same flag as the `start.sh` check |
+| `DUMPLOG` | Enables p2pcam's internal P2P debug log. Creates **`/mnt/mmc01/0/<serial>_debug.log`** during p2pcam startup, **only when eye.conf is valid** (32 bytes). With an empty eye.conf the log is redirected to `/tmp/ipc_debug.log` (RAM) and no file appears on the SD. Written during normal boot — does not require p2pcam to exit. **Contains sensitive data (MAC, UUID).** Verified by live test. |
+| `cls.conf` | Parsed by `checkDebugWifiConfig()` — debug WiFi/static IP configuration |
+| `accesskey.key` | Copied to `/tmp/accesskey.key` — purpose unknown |
+| `SPEED_PASS` | **Result marker, not a trigger.** `init_sd_card` only ever removes it (when no SD is detected, the SD is empty, or neither `/home/eye.conf` nor `/bak/eye.conf` exists). Placing it on the SD manually has no observable effect on `init_sd_card`. |
+
+**`/home/` — permanent flash, checked at every boot by `start.sh`**
+
+| File | Effect |
+|------|--------|
+| `firmware.bin` | Firmware upgrade from flash (same as SD version) |
+| `eye.conf` | Moved to `/bak/eye.conf` (replaces whatever was there) |
+| `hardinfo.bin` | Moved to `/bak/hardinfo.bin` |
+| `hwcfg.ini` | Moved to `/bak/hwcfg.ini` |
+| `ptz.cfg` | Moved to `/bak/ptz.cfg` |
+| `image.ini` | Moved to `/bak/image.ini` |
+| `VOICE.tgz` | Moved to `/bak/VOICE.tgz` |
+| `SD_CHECK` | Forces SD health check on next boot (removed automatically after passing). Also created by `init_sd_card` itself if the SD mount fails — so it retries on the next boot. |
+| `SD_NOMOUNT` | **Crash guard** managed by `init_sd_card` itself: created at the start of each SD init, removed on success. If present at boot, it means the previous SD init crashed (power loss, etc.) → SD is treated as suspect, mount is blocked, `/tmp/sd_no_mount` is created, and p2pcam reboots. Do not place manually. |
+| `TF_RWERROR_TIME` | SD write-error timestamp tracking — removed by `init_sd_card` only when no SD is detected, the SD is empty, or neither `/home/eye.conf` nor `/bak/eye.conf` exists. Persists across normal boots. |
+| `TF_RWERROR_FLAG` | SD write-error flag — removed by `init_sd_card` under the same conditions as `TF_RWERROR_TIME`. |
+| `rmid` | Processed by `factory_tool.sh`: deletes `/bak/eye.conf` |
+| `START_FLAG` | Read at startup by `status_ctrl_thread` to control LED2 state. Cleaned up by factory reset if present without `STOP_FLAG`. Exact lifecycle unknown. |
+| `STOP_FLAG` | Read alongside `START_FLAG` at startup: both present → LED2 on. Exact lifecycle unknown. |
+| `OFFLINE_REBOOT` | Contains an integer count read by `getDevRebootTimes()`. Tracks how many times the device has rebooted in an offline state. |
+
+**`/bak/eye.conf` — the key state flag**
+
+| State | Effect |
+|-------|--------|
+| 32 bytes (valid) | `p2pcam` takes P2P cloud path — port 554 closed |
+| 0 bytes or absent | `p2pcam` takes SONG TOOL path — port 554 opens |
+
+### Diagnostic files
+
+**`/tmp/` — RAM, lost on reboot**
+
+| File | Written by | Contents |
+|------|-----------|----------|
+| `augentix.log` | kernel syslogd | Kernel messages, USB/WiFi driver events, network events |
+| `closelicamera.log` | Closeli SDK | SDK runtime log: stream state, cloud connection, relay server pings. Ring buffer, max 1000 lines (`CLOSELICAMERA_LOGMAXLINE=1000`) |
+| `sd_no_mount` | `init_sd_card` | Created when `/home/SD_NOMOUNT` exists; signals that SD mount was blocked |
+| `accesskey.key` | `init_sd_card` | Copied from `/mnt/mmc01/accesskey.key` if present on SD at boot |
+
+**`/tmp/` — trigger files checked at runtime (place before `p2pcam` starts)**
+
+| File | Checked by | Effect |
+|------|-----------|--------|
+| `forceday` | `icrCtrlThd` thread / `isImageNeedForceToDay()` | Forces ISP to daytime mode every 60 seconds. Without this file the function only applies daytime mode once per hour between 04:00 and 16:59. |
+
+**`/home/` — permanent flash, survives reboots and power cycles**
+
+| File | Written by | Contents |
+|------|-----------|----------|
+| `reboot.time` | `start.sh` (on p2pcam exit) | Unix timestamp of the last time p2pcam stopped: `[data]\ntime = <unix_ts>` |
+| `config.cfg` | Closeli SDK | Cloud credentials JSON: account email, device IDs, cloud token, secret key, relay server IPs. **Contains sensitive data — delete or protect if sharing.** |
+| `config.cfg.bak` | Closeli SDK | Backup copy of `config.cfg` |
+| `config.xml` | Closeli SDK | Camera settings: timezone, WiFi SSID, resolution, motion sensitivity, night vision, schedules, SDK version. |
+| `dst.cfg` | Closeli SDK | DST rules JSON for the configured timezone. |
+| `dev.env` | Closeli SDK | Environment flag (`dev_env=pro`). |
+| `work.log` | Closeli SDK | Connection history: WiFi connections, API calls, timestamps. Uses MAC address as device identifier. |
+| `idx.log` | Closeli SDK | Entry count for `work.log`. |
+| `silent_reboot` | `p2pcam` | Created immediately before a watchdog or connectivity-triggered reboot (video/audio stall, 4G failure, no valid IP after retries). Marks that the previous session ended uncleanly. |
+
+**SD card — output files written by `p2pcam`**
+
+| File | Written by | Contents |
+|------|-----------|----------|
+| `ipc.log.0` | `tees` daemon | Full diagnostic dump: Closeli SDK log, system state snapshots (`ps`, `ifconfig`, `df`, `netstat`, `free`), and p2pcam stdout ("Dump of log" section). Created when `FSRW` is present; written when p2pcam exits (start.sh sends `SIGUSR1` to tees). The `.0` suffix comes from tees log rotation: `-o ipc.log` creates `ipc.log.0` for the first dump, `ipc.log.1` for the next, up to 20 files. **May contain sensitive data (cloud credentials logged by the Closeli SDK).** |
+| `<serial>_debug.log` | `p2pcam` (DUMPLOG flag) | p2pcam startup debug log. Only created when eye.conf is valid (32 bytes) — the P2P subsystem must initialise for the file to be written. Filename is the 32-character P2P serial. Contents: ONVIF WS-Discovery Hello (UUID, IP), Closeli SDK version, `set_device_info` (module ID, firmware version, serial, MAC), init callbacks (resolution, rotation, audio, antiflicker), ISP mode. Written early in the boot — complete before the camera is fully operational. **Contains MAC address and UUID.** Delete from SD after use. Verified by live test. |
+| `/mnt/mmc01/0/GPSLOG/` | `p2pcam` | Created automatically by p2pcam when GPS logging is active. p2pcam creates the directory if it does not exist, then creates date subdirectories (`YYYY-MM-DD/`) and writes GPS log files named `%02dH%02dM%02dS.log` (e.g. `14H30M05S.log`). Only written when RTC time is valid. |
+| `/mnt/mmc01/0/g4log.txt` | `p2pcam` | p2pcam event log. Each entry is prefixed with a `YYYY/MM/DD HH:MM:SS` timestamp. **Only written when `DUMPLOG` is present on the SD at runtime.** |
+| `/mnt/mmc01/0/g4errlog.txt` | `p2pcam` | p2pcam error log. Same format as `g4log.txt`. **Only written when `DUMPLOG` is present on the SD at runtime.** |
 
 ### RTSP Connection
 
@@ -110,6 +234,133 @@ Current version works from microSD card and do not require installation.
 * rtsp://admin:@192.168.200.1:8001
 * rtsp://admin:@192.168.200.1:8001/0/av0 (with audio)
 * rtsp://admin:@192.168.200.1:8001/0/av1 (low quality)
+
+### How port 554 opens — binary analysis
+
+Port 554 and cloud P2P coexist because of two independent mechanisms in `p2pcam`.
+
+**Why port 554 opens (static — always true on stock firmware):**
+
+`load_hardware_config` reads `/bak/defalut.config` at every boot.
+Stock firmware ships with `support_onvif=1` in that file.
+This sets an internal flag (`g_onvif_enabled`, address `0x5cc0b0`).
+
+`is_rtsp_enabled()` (address `0x2802c`) returns 1 when:
+1. `g_onvif_enabled != 0` — ONVIF enabled (always true on stock cameras)
+2. `g_dev_config[0x3c4] == 0` — camera has never registered with the AJCloud/Closeli cloud
+
+When both conditions hold, `ctp_server_init` binds TCP port 554.
+
+**Why SONG TOOL path is taken (the eye.conf trick):**
+
+`p2pcam` has two startup paths — P2P (cloud) and SONG TOOL (local).
+It takes the P2P path only if eye.conf decodes correctly with the key `"iloveyou"`.
+`load_eye_conf` tries `/home/eye.conf` first, then falls back to `/bak/eye.conf`.
+The hack leaves `/bak/eye.conf` as a 0-byte file: decode fails → SONG TOOL path taken.
+SONG TOOL starts `ctp_server_init`, which is where `is_rtsp_enabled()` is called.
+
+**Why cloud still works:**
+
+P2P cloud credentials are loaded after the path decision — a separate step reads the
+device serial and credentials independently of the eye.conf decode result.
+Both port 554 and cloud are active simultaneously.
+
+**Summary of the boot sequence:**
+```
+load_hardware_config  →  support_onvif=1  →  g_onvif_enabled=1
+load_eye_conf         →  /bak/eye.conf empty  →  decode fails  →  g_eyeconf_loaded=0
+start_p2p_or_songtool →  g_eyeconf_loaded=0  →  SONG TOOL path
+ctp_server_init       →  is_rtsp_enabled() returns 1  →  port 554 bound
+                      →  P2P cloud connects independently
+```
+
+**How an empty eye.conf keeps port 554 open permanently:**
+
+`p2pcam` decides at startup whether to take the P2P (cloud) path or the SONG TOOL (local)
+path. The decision depends on whether eye.conf can be decoded successfully (`load_eye_conf`
+tries `/home/eye.conf` first, then `/bak/eye.conf`).
+`eye.conf` is encrypted with a custom LSB-first DES variant using the key `"iloveyou"`.
+An empty file always fails to decode → `p2pcam` always takes the SONG TOOL path →
+`ctp_server_init` runs → `is_rtsp_enabled()` returns 1 → port 554 is bound.
+
+The trigger is simply: `touch /home/eye.conf`
+
+`start.sh` then does `mv -f /home/eye.conf /bak/eye.conf`, so `/bak/eye.conf` becomes
+and stays 0 bytes across all subsequent boots — `/bak/` is permanent flash.
+`p2pcam` finds the empty `/bak/eye.conf` on every boot and the SONG TOOL path is always taken.
+Confirmed by binary analysis: `p2pcam` never deletes or modifies `eye.conf` itself.
+
+**Enabling RTSP on a stock camera (port 554 not yet open):**
+
+If the camera has a valid `eye.conf` and port 554 is closed, a single command activates it:
+
+> **Warning — backup eye.conf first.** `touch /home/eye.conf` creates an empty file that
+> `start.sh` will move to `/bak/eye.conf` on the next boot, permanently overwriting the
+> original 32-byte file. Once overwritten, the P2P serial stored in it is unrecoverable
+> from the device. Save it before proceeding:
+> ```sh
+> python3 tools/gen_eyeconf.py decode /bak/eye.conf
+> # note the serial somewhere safe before continuing
+> ```
+
+```sh
+touch /home/eye.conf && reboot
+```
+After the reboot `start.sh` moves the empty file to `/bak/eye.conf` and port 554 opens
+on every subsequent boot without any further intervention.
+
+**Using cloud P2P and RTSP at the same time:**
+
+Both work simultaneously. To keep the cloud app working while also opening port 554:
+1. Register the camera in the vendor app first (AJCloud / Closeli / iCam365)
+2. Once the camera appears in the app, run `touch /home/eye.conf && reboot`
+3. Port 554 opens and the cloud connection keeps working
+
+This works because the cloud registration token is stored separately in flash and is not
+affected by the state of `eye.conf`. `eye.conf` only controls which startup path `p2pcam`
+takes, not whether the cloud credentials are valid.
+
+**Recovering a lost eye.conf:**
+
+If `eye.conf` has been emptied and you want to restore P2P-only mode, you need to
+regenerate the 32-byte encrypted file from the device's P2P serial number.
+
+> **Warning:** once `eye.conf` is emptied the serial is gone from the device — it is
+> not stored in any log file, config file, or physical label. Save it first.
+
+The serial is a 32-character alphanumeric string unique to each unit.
+Where to find it:
+
+- **Decode eye.conf via SSH** — while it still has the original 32 bytes:
+  ```sh
+  python3 tools/gen_eyeconf.py decode /bak/eye.conf
+  ```
+- **SD card boot log (no SSH needed)** — place a file named `FSRW` at the root of the
+  SD card and boot the camera. The firmware starts a logging daemon (`tees`) that
+  captures `p2pcam` stdout to `ipc.log.0` on the SD card. The serial appears there as
+  `GET EYE SER: <serial>` — but only if `eye.conf` still has the original 32 bytes;
+  with an empty `eye.conf` the serial line is absent; instead the log contains `eye id size = 0` followed by `err id`.
+  > **Warning:** `FSRW` also triggers `factory_tool.sh`, a factory provisioning script
+  > that can overwrite `/bak/hardinfo.bin`, `/bak/ptz.cfg` and `/bak/hwcfg.ini` if
+  > files with matching names are present on the SD card. Keep the SD card clean — only
+  > the `FSRW` file. Also, `ipc.log.0` contains sensitive data (cloud tokens, config)
+  > logged by the Closeli SDK; delete it from the SD after use.
+- **Vendor app** — if the camera was previously registered, open YCC365 Plus (or
+  AJCloud/Closeli), go to **Device details → Serial number**. This shows the full
+  32-character P2P serial even after `eye.conf` has been emptied.
+
+> **Note:** the QR code on the HC1703L label encodes the MAC address, not the P2P
+> serial. There is no other copy of the serial on the device.
+
+**Recovering eye.conf once you have the serial:**
+```sh
+# Generate the 32-byte eye.conf from your serial
+python3 tools/gen_eyeconf.py encode <YOUR_SERIAL> -o eye.conf
+
+# Install via SSH (start.sh moves /home/eye.conf to /bak/eye.conf on next boot)
+cat eye.conf | ssh root@<CAMERA_IP> 'cat > /home/eye.conf'
+```
+Restoring a valid eye.conf disables port 554 and returns the camera to P2P-only mode.
 
 
 ### End of Startup process
