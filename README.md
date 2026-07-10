@@ -119,6 +119,15 @@ Current version works from microSD card and do not require installation.
 
 ## Additional info
 
+### End of Startup process
+
+After the [boot process](https://github.com/Jalecom/AJ_HC1703L_Teardown/blob/main/AugentixFWboot_noSDcard.log), the camera retain the `/home` folder even after a powerdown, until the reset button is manually pressed.\
+the `/bak` folder is mounted as ReadOnly and retain all the files requested to startup including `start.sh` and `p2pcam.sqfs`.\
+the `/tmp` folder is created at every boot and the `start.sh` is copied from `/bak`; the one in `/tmp` is the one executed during the startup process. `/mnt`, `/var`, log and ini files are here.\
+the `start.sh` load some drivers, check if a `firmware.bin` or a `debug_cmd.sh` is on the SD card and upgrade or run it, then init the sensor, ptz, voice, wifi, call `rsyscall.hc1703` and finally mount `/bak/p2pcam.sqfs` to run the p2pcam (closed source bineary), wich control all the higher function of the camera and try to connect with the cloud.\
+the `debug_cmd.sh` open a web server for PTZ camera control on IP port 8080; add a SSH and a FTP server; overwrite temporary `hosts`, `profile`, `group`, `passwd`, and `shadow` file; connect with your credential to your WiFi and update via NTP the clock.
+
+
 ### Trigger / flag files
 
 Files whose presence activates mechanisms in the firmware. None need to contain data unless noted.
@@ -361,15 +370,6 @@ python3 tools/gen_eyeconf.py encode <YOUR_SERIAL> -o eye.conf
 cat eye.conf | ssh root@<CAMERA_IP> 'cat > /home/eye.conf'
 ```
 Restoring a valid eye.conf disables port 554 and returns the camera to P2P-only mode.
-
-
-### End of Startup process
-
-After the [boot process](https://github.com/Jalecom/AJ_HC1703L_Teardown/blob/main/AugentixFWboot_noSDcard.log), the camera retain the `/home` folder even after a powerdown, until the reset button is manually pressed.\
-the `/bak` folder is mounted as ReadOnly and retain all the files requested to startup including `start.sh` and `p2pcam.sqfs`.\
-the `/tmp` folder is created at every boot and the `start.sh` is copied from `/bak`; the one in `/tmp` is the one executed during the startup process. `/mnt`, `/var`, log and ini files are here.\
-the `start.sh` load some drivers, check if a `firmware.bin` or a `debug_cmd.sh` is on the SD card and upgrade or run it, then init the sensor, ptz, voice, wifi, call `rsyscall.hc1703` and finally mount `/bak/p2pcam.sqfs` to run the p2pcam (closed source bineary), wich control all the higher function of the camera and try to connect with the cloud.\
-the `debug_cmd.sh` open a web server for PTZ camera control on IP port 8080; add a SSH and a FTP server; overwrite temporary `hosts`, `profile`, `group`, `passwd`, and `shadow` file; connect with your credential to your WiFi and update via NTP the clock.
 
 
 ## Device Details
